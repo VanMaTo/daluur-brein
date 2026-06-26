@@ -43,7 +43,7 @@ TOESTELLEN = [
     {
         "naam": "warmtepomp",
         "id": "bff1ab1d1427ccdd9ag0z4",
-        "actief": False,
+        "actief": True,
         "volgorde": 3,
         "schakelcode": "switch",      # bevestigd uit de status
         "meet_verbruik": False,
