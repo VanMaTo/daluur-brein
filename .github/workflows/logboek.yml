@@ -1,0 +1,20 @@
+name: Daluur logboek
+
+on:
+  workflow_dispatch:        # handmatige knop
+
+jobs:
+  logboek:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TUYA_REGION: "eu"
+      TUYA_CLIENT_ID: ${{ secrets.TUYA_CLIENT_ID }}
+      TUYA_SECRET: ${{ secrets.TUYA_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python logboek.py
