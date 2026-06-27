@@ -1,0 +1,33 @@
+name: Daluur brein
+
+on:
+  schedule:
+    # elke 2 minuten (public repo = gratis & onbeperkt). GitHub slaat soms runs
+    # over; een dicht schema houdt de schade klein. Het script rekent zelf met de
+    # Spaanse tijd en is idempotent, dus vaak draaien is veilig.
+    - cron: "*/2 * * * *"
+  workflow_dispatch:        # knop om handmatig te starten (om te testen)
+
+concurrency:
+  group: daluur-brein
+  cancel-in-progress: false
+
+jobs:
+  schakel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # publiek, mag gewoon hier staan:
+      SUPABASE_URL: "https://biczcyeukjtfkriwzsgm.supabase.co"
+      SUPABASE_ANON: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJpY3pjeWV1a2p0ZmtyaXd6c2dtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI0NjczNjIsImV4cCI6MjA5ODA0MzM2Mn0.sZyAKaDbmIP6nronlQA5NgozMabSiEbPz3_rL4SoJzY"
+      TUYA_REGION: "eu"
+      # geheim, komt versleuteld uit GitHub Secrets:
+      TUYA_CLIENT_ID: ${{ secrets.TUYA_CLIENT_ID }}
+      TUYA_SECRET: ${{ secrets.TUYA_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python brein.py
