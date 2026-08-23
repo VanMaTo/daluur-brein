@@ -41,11 +41,49 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ---------- telegram ----------
+# Waarschuwingen (berichten die met een waarschuwingsteken beginnen) worden
+# afgeremd: hoogstens een keer per ALARM_PAUZE seconden. Zonder die rem meldt
+# het brein bij een aanhoudende storing ELK UUR hetzelfde probleem, en dan
+# leest niemand ze nog. Informatieve berichten (zoals de dagprijzen) gaan
+# altijd door.
+#
+# Het stempelbestand wordt gedeeld met waakhond.py, zodat die twee niet
+# achter elkaars rug om alsnog dubbel alarm slaan.
+ALARM_PAUZE   = 6 * 3600
+ALARM_STEMPEL = "/var/tmp/daluur_laatste_alarm"
+
+
+def _is_waarschuwing(tekst):
+    return tekst.lstrip().startswith(("\u26a0", "\u274c"))
+
+
+def _mag_alarmeren():
+    """True als het lang genoeg geleden is dat we alarm sloegen."""
+    try:
+        return (time.time() - os.path.getmtime(ALARM_STEMPEL)) > ALARM_PAUZE
+    except OSError:
+        return True          # nog nooit alarm geslagen
+
+
+def _stempel_alarm():
+    try:
+        with open(ALARM_STEMPEL, "w") as f:
+            f.write(datetime.datetime.now().isoformat())
+    except OSError:
+        pass
+
+
 def stuur_telegram(tekst):
     """Stuurt een Telegram-bericht. Ontbrekende instellingen of een falende
     request mogen het brein nooit doen crashen -> stil overslaan/loggen."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
+
+    if _is_waarschuwing(tekst):
+        if not _mag_alarmeren():
+            print("  waarschuwing niet verstuurd (al recent gemeld)")
+            return
+        _stempel_alarm()
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
