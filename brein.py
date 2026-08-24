@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import json
+import socket
 import datetime
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,14 @@ from tinytuya import Cloud
 from toestellen import TOESTELLEN
 
 # ---------- instellingen ----------
+# Harde tijdslimiet op ELKE netwerkverbinding. Zonder dit blijft een verbinding
+# die niet antwoordt eeuwig openstaan: het script hangt dan voorgoed, zonder
+# foutmelding, en cron stapelt er elk uur een nieuwe bovenop. Precies wat er
+# op 24/08/2026 gebeurde -- vijf vastgelopen processen, zwembad de hele ochtend
+# uit. De tinytuya-bibliotheek stelt zelf geen limiet in; deze regel dwingt er
+# een af voor alles wat het script opent.
+socket.setdefaulttimeout(30)
+
 TZ = ZoneInfo("Europe/Madrid")
 DEFAULT_N = 4
 PAUZE = 60                              # seconden tussen de toestellen
