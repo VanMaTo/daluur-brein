@@ -143,6 +143,26 @@ def get_standaard_n(groep):
     return DEFAULT_N
 
 
+def is_groep_actief(groep):
+    """False als je deze groep uitdrukkelijk hebt uitgezet in de instellingen
+    (bv. de warmtepomp buiten het zwemseizoen). Zo'n groep wordt daarna
+    volledig overgeslagen: geen schakelpoging, geen wachten tot hij online
+    komt, en dus ook geen Telegram-melding meer als hij toch offline blijft.
+
+    Bij twijfel (tabel/rij/kolom onbereikbaar) blijft de groep AAN -> fail-safe,
+    zodat een verbindingsfout nooit per ongeluk een groep laat stilvallen."""
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/instellingen?groep=eq.{groep}&select=actief",
+                         headers=_sb_headers(), timeout=15)
+        r.raise_for_status()
+        rows = r.json()
+        if rows and isinstance(rows[0].get("actief"), bool):
+            return rows[0]["actief"]
+    except Exception as e:
+        print(f"    actief-status ophalen ({groep}) mislukt: {e}")
+    return True
+
+
 def upsert_plan(datum, groep, n, uren, handmatig=False):
     requests.post(f"{SUPABASE_URL}/rest/v1/planning",
                   headers=_sb_headers({"Prefer": "resolution=merge-duplicates"}),
@@ -455,14 +475,23 @@ def main():
         print(f"    {g}: {bron} -> {toon}")
 
     # 3) doel per toestel bepalen
+    #    - eerst: staat de groep van dit toestel uberhaupt AAN in de instellingen?
+    #      (bv. de warmtepomp buiten het zwemseizoen) Zo niet -> volledig overslaan,
+    #      geen schakelpoging en dus ook geen storingsmelding via Telegram.
     #    - basis: staat dit uur in het schema van zijn groep?
     #    - 'hangt_af_van': draait de groep waarvan dit toestel stroom krijgt
     #      (bv. de WP hangt aan de circulatie via de flow-teleruptor)? Zo niet,
     #      dan is het toestel stroomloos -> overslaan (niet lezen, niet schakelen).
     doel = {}
     te_beheren = []
+    groep_actief_cache = {}
     for t in toestellen:
         g = t.get("groep", "circulatie")
+        if g not in groep_actief_cache:
+            groep_actief_cache[g] = is_groep_actief(g)
+        if not groep_actief_cache[g]:
+            print(f"    {t['naam']}: groep '{g}' staat UIT in de instellingen -> overgeslagen")
+            continue
         g_uren = groep_uren.get(g)
         if g_uren is None:
             print(f"    {t['naam']}: schema ({g}) onbekend -> met rust gelaten")
