@@ -61,6 +61,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 ALARM_PAUZE   = 6 * 3600
 ALARM_STEMPEL = "/var/tmp/daluur_laatste_alarm"
 
+# Het bericht "prijzen zijn binnen" gaat maar EEN keer per dag weg. Het brein
+# draait elk uur; zonder deze stempel kwam hetzelfde bericht om 21:01, 22:01
+# en 23:01. In het bestand staat de datum waarvoor al gemeld is.
+PRIJSMELDING_STEMPEL = "/var/tmp/daluur_prijsmelding"
+
 
 def _is_waarschuwing(tekst):
     return tekst.lstrip().startswith(("\u26a0", "\u274c"))
@@ -101,8 +106,26 @@ def stuur_telegram(tekst):
         )
         if not r.ok:
             print(f"  telegram-bericht mislukt: {r.status_code} {r.text}")
+        return r.ok
     except Exception as e:
         print(f"  telegram-bericht mislukt: {e}")
+    return False
+
+
+def _prijzen_al_gemeld(datum):
+    try:
+        with open(PRIJSMELDING_STEMPEL) as f:
+            return f.read().strip() == datum
+    except OSError:
+        return False
+
+
+def _stempel_prijsmelding(datum):
+    try:
+        with open(PRIJSMELDING_STEMPEL, "w") as f:
+            f.write(datum)
+    except OSError:
+        pass
 
 
 def actieve_toestellen():
@@ -161,6 +184,23 @@ def is_groep_actief(groep):
     except Exception as e:
         print(f"    actief-status ophalen ({groep}) mislukt: {e}")
     return True
+
+
+def voorbeeld_uren(groep, datum, prijzen):
+    """Welke uren deze groep op 'datum' zal draaien -- enkel LEZEN, niets
+    terugschrijven. Zelfde logica als bepaal_uren: handmatige keuze gaat voor,
+    anders het ingestelde aantal goedkoopste uren."""
+    try:
+        plan = get_plan(datum, groep)
+    except Exception as e:
+        print(f"    planning morgen ophalen ({groep}) mislukt: {e}")
+        plan = None
+    if plan and isinstance(plan.get("uren"), list) and plan.get("handmatig"):
+        return sorted(int(x) for x in plan["uren"]), "handmatig"
+    n = plan.get("n") if (plan and isinstance(plan.get("n"), int)) else None
+    if not isinstance(n, int) or n < 0 or n > 24:
+        n = get_standaard_n(groep)
+    return cheapest_hours(prijzen, n), f"{n}u"
 
 
 def upsert_plan(datum, groep, n, uren, handmatig=False):
@@ -459,10 +499,18 @@ def main():
     if (now.hour, now.minute) >= (20, 15):
         morgen = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         prijzen_morgen = haal_en_schrijf(morgen)
-        if prijzen_morgen:
-            goedkoopste = cheapest_hours(prijzen_morgen, DEFAULT_N)
-            uren_txt = ", ".join(f"{u:02d}u" for u in goedkoopste)
-            stuur_telegram(f"☀️ Daluur: prijzen voor {morgen} zijn binnen.\nGoedkoopste uren: {uren_txt}")
+        if prijzen_morgen and not _prijzen_al_gemeld(morgen):
+            # per actieve groep de uren die morgen echt geschakeld worden
+            regels = []
+            for g in sorted(set(t.get("groep", "circulatie") for t in toestellen)):
+                if not is_groep_actief(g):
+                    continue
+                uren, bron = voorbeeld_uren(g, morgen, prijzen_morgen)
+                uren_txt = ", ".join(f"{u:02d}u" for u in uren) or "geen"
+                regels.append(f"{g} ({bron}): {uren_txt}")
+            tekst = f"☀️ Daluur: prijzen voor {morgen} zijn binnen.\n" + "\n".join(regels)
+            if stuur_telegram(tekst):
+                _stempel_prijsmelding(morgen)
 
     # 2) planning per GROEP bepalen (elke groep = eigen schema)
     groepen = sorted(set(t.get("groep", "circulatie") for t in toestellen))
