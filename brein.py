@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================
 #  DALUUR — BREIN
-#  Draait elk uur via GitHub Actions.
+#  Draait elk uur op :01 via cron op de Pi (run.sh).
+#
+#  Volgorde (afhankelijkheden, sinds 23/10/2026):
+#    circulatie start      : pomp -> 60s -> zout -> WP (aan of uit, zoals gepland)
+#    WP in/uit, pomp blijft: WP meteen
+#    circulatie stopt      : WP uit -> bevestigen -> 180s nadraai -> zout -> 60s -> pomp
+#    circulatie blijft uit : WP stroomloos -> niet aanraken
 #  Toestellen beheer je in  toestellen.py , niet hier.
 #
 #  1. leest de planning uit Supabase (of berekent de N goedkoopste)
@@ -37,6 +43,11 @@ DEFAULT_N = 4
 PAUZE = 60                              # seconden tussen de toestellen
 WP_POLL = 25                            # seconden tussen 'is de WP al online?'-checks
 WP_MAX_WACHT = 240                      # max. seconden wachten tot de WP online komt
+WP_BEVESTIG = 30                        # max. seconden wachten tot 'WP staat UIT' bevestigd is
+WP_NADRAAI = 180                        # seconden flow na het uitzetten van de WP, vóór
+                                        # zout en pomp stoppen (inverter afbouwen, ventilator
+                                        # uitlopen). Zonder dit snijdt de flow-teleruptor de
+                                        # WP midden in zijn werking af (Poolex Vertigo FI).
 
 # ---------- geheimen / omgeving ----------
 SUPABASE_URL  = os.environ["SUPABASE_URL"].rstrip("/")
@@ -361,6 +372,18 @@ def toestel_online(c, dev, code):
     return isinstance(props.get(code), bool) if code else bool(props)
 
 
+def wacht_tot_online(c, naam, dev, code):
+    """Wacht tot een toestel met zwakke wifi (de WP) bereikbaar is.
+    Geeft (online, gewacht_in_seconden)."""
+    gewacht = 0
+    online = toestel_online(c, dev, code)
+    while not online and gewacht < WP_MAX_WACHT:
+        print(f"       {naam} nog niet online, wacht… ({gewacht}s)")
+        time.sleep(WP_POLL); gewacht += WP_POLL
+        online = toestel_online(c, dev, code)
+    return online, gewacht
+
+
 def detecteer_schakelcode(codes):
     for pref in ("switch_1", "switch", "on_off", "swtich"):
         if pref in codes:
@@ -529,9 +552,11 @@ def main():
     #    - basis: staat dit uur in het schema van zijn groep?
     #    - 'hangt_af_van': draait de groep waarvan dit toestel stroom krijgt
     #      (bv. de WP hangt aan de circulatie via de flow-teleruptor)? Zo niet,
-    #      dan is het toestel stroomloos -> overslaan (niet lezen, niet schakelen).
+    #      dan moet het toestel UIT. Of het nu nog stroom heeft, hangt af van de
+    #      HUIDIGE stand van de circulatie -> beslist in stap 4b, na het uitlezen.
     doel = {}
     te_beheren = []
+    voor_uit_kandidaat = []   # WP's die uit moeten omdat de circulatie stopt
     groep_actief_cache = {}
     for t in toestellen:
         g = t.get("groep", "circulatie")
@@ -547,13 +572,17 @@ def main():
         dep = t.get("hangt_af_van")
         if dep:
             dep_uren = groep_uren.get(dep)
-            if dep_uren is None or uur not in dep_uren:
-                print(f"    {t['naam']}: {dep} draait dit uur niet -> stroomloos, overgeslagen")
+            if dep_uren is None:
+                print(f"    {t['naam']}: schema ({dep}) onbekend -> met rust gelaten")
+                continue
+            if uur not in dep_uren:
+                doel[t["naam"]] = False
+                voor_uit_kandidaat.append(t)
                 continue
         doel[t["naam"]] = uur in g_uren
         te_beheren.append(t)
 
-    if not te_beheren:
+    if not te_beheren and not voor_uit_kandidaat:
         print("  niets te beheren dit uur.")
         return
 
@@ -570,11 +599,69 @@ def main():
         wil = "AAN" if doel[t["naam"]] else "UIT"
         print(f"    {t['naam']}: code={code}  staat nu {leesbaar}  moet {wil}")
 
+    # 4b) WP's waarvan de circulatie dit uur stopt: heeft de WP NU nog stroom?
+    #     Ja als een toestel van zijn circulatiegroep nu (mogelijk) aan staat.
+    #     Onleesbaar telt als 'mogelijk aan' -> liever netjes uitzetten (fail-safe).
+    #     Staat de circulatie al uit, dan is de WP stroomloos -> niet aanraken.
+    voor_uit = []
+    for t in voor_uit_kandidaat:
+        dep = t["hangt_af_van"]
+        dep_info = [info[d["naam"]] for d in te_beheren
+                    if d.get("groep", "circulatie") == dep and not d.get("hangt_af_van")]
+        if dep_info and any(i["stand"] is not False for i in dep_info):
+            code = t.get("schakelcode")
+            if not code:
+                print(f"    {t['naam']}: geen schakelcode in toestellen.py -> overgeslagen")
+                continue
+            info[t["naam"]] = {"id": t["id"], "code": code, "stand": None}
+            voor_uit.append(t)
+            print(f"    {t['naam']}: {dep} stopt dit uur -> EERST de WP uit, dan {dep}")
+        else:
+            print(f"    {t['naam']}: {dep} staat uit -> stroomloos, overgeslagen")
+
     # 5) schakelen
     beheerbaar = [t for t in te_beheren if info[t["naam"]]["code"]]
     gewone   = [t for t in beheerbaar if not t.get("hangt_af_van")]
     flow_afh = [t for t in beheerbaar if t.get("hangt_af_van")]   # bv. de WP
     mislukt = []   # (naam, reden) — voor het Telegram-alertbericht op het einde
+
+    # 5-vooraf) circulatie stopt: WP eerst netjes UIT, bevestigen, nadraaien.
+    #     Pas daarna zout en pomp. Is de WP onbereikbaar, dan toch verder
+    #     (anders draait de pomp door op dure uren) + Telegram-melding.
+    nadraai = False
+    for t in voor_uit:
+        naam = t["naam"]; code = info[naam]["code"]
+        online, gewacht = wacht_tot_online(c, naam, t["id"], code)
+        if not online:
+            print(f"       {naam} onbereikbaar na {gewacht}s — circulatie stopt toch (WP wordt hard afgesneden)")
+            mislukt.append((naam, f"onbereikbaar vóór het stoppen van de circulatie ({gewacht}s) — hard afgesneden"))
+            continue
+        stand = lees_props(c, t["id"]).get(code)
+        if stand is False:
+            print(f"       {naam} staat al UIT — geen nadraai nodig")
+            continue
+        print(f"       {naam} online na {gewacht}s  ->  UIT (vóór de circulatie)")
+        res = set_switch(c, t["id"], code, False)
+        if tuya_error(res):
+            print(f"       FOUT bij {naam}: {res}")
+            mislukt.append((naam, "schakelfout bij uitzetten vóór de circulatie"))
+            continue
+        # bevestigen dat hij echt uit staat
+        bevestigd, b = False, 0
+        while b < WP_BEVESTIG:
+            time.sleep(10); b += 10
+            if lees_props(c, t["id"]).get(code) is False:
+                bevestigd = True
+                break
+        if bevestigd:
+            print(f"       {naam} bevestigd UIT na {b}s")
+        else:
+            print(f"       {naam} UIT niet bevestigd na {b}s — toch nadraai")
+            mislukt.append((naam, "uitzetten niet bevestigd"))
+        nadraai = True
+    if nadraai:
+        print(f"       nadraai: {WP_NADRAAI}s flow vóór zout en pomp stoppen")
+        time.sleep(WP_NADRAAI)
 
     # 5a) gewone toestellen (circulatie & zout): UIT eerst in omgekeerde volgorde,
     #     dan AAN oplopend. Onleesbaar telt als 'klopt niet' -> schakelen (fail-safe).
@@ -601,12 +688,7 @@ def main():
     #     hij nooit 'blijven hangen' in zijn vorige stand na een stroomonderbreking.
     for t in flow_afh:
         naam = t["naam"]; code = info[naam]["code"]; wil = doel[naam]
-        gewacht = 0
-        online = toestel_online(c, t["id"], code)
-        while not online and gewacht < WP_MAX_WACHT:
-            print(f"       {naam} nog niet online, wacht… ({gewacht}s)")
-            time.sleep(WP_POLL); gewacht += WP_POLL
-            online = toestel_online(c, t["id"], code)
+        online, gewacht = wacht_tot_online(c, naam, t["id"], code)
         if not online:
             print(f"       {naam} bleef offline na {gewacht}s — overgeslagen, volgende run opnieuw")
             mislukt.append((naam, f"niet online gekomen na {gewacht}s"))
