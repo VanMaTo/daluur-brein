@@ -13,11 +13,17 @@
 #    - Datadis "01:00" = verbruik 00-01u = uur 0 in meter_uur
 #    - wintertijd (laatste zondag oktober): het dubbele uur wordt
 #      opgeteld, net als bij de handmatige CSV
+#    - Datadis laat dezelfde maand maar een keer per dag opvragen
+#      (anders fout 429): dan wordt die maand overgeslagen, zonder
+#      alarm; de andere maand wordt wel weggeschreven
 #    - Telegram-melding als het ophalen mislukt of de data al
 #      dagen niet meer aangroeit
+#
+#  Handmatig een maand (bij)laden:  python3 datadis.py 2026/08
 # ============================================================
 
 import os
+import sys
 import datetime
 
 import requests
@@ -101,15 +107,25 @@ def schrijf_meter(rijen):
 def main():
     now = datetime.datetime.now(TZ)
     stamp = now.strftime("%Y-%m-%d %H:%M")
-    eerste = now.date().replace(day=1)
-    vorige = (eerste - datetime.timedelta(days=1)).replace(day=1)
-    maanden = [vorige.strftime("%Y/%m"), eerste.strftime("%Y/%m")]
+    if len(sys.argv) > 1:
+        maanden = sys.argv[1:]                      # handmatig, bv. 2026/08
+    else:
+        eerste = now.date().replace(day=1)
+        vorige = (eerste - datetime.timedelta(days=1)).replace(day=1)
+        maanden = [vorige.strftime("%Y/%m"), eerste.strftime("%Y/%m")]
 
     try:
         token = datadis_login()
         items = []
+        beperkt = []                                # maanden geweigerd met 429
         for m in maanden:
-            items += haal_maand(token, m)
+            try:
+                items += haal_maand(token, m)
+            except requests.HTTPError as e:
+                if e.response is None or e.response.status_code != 429:
+                    raise
+                beperkt.append(m)
+                print(f"[DATADIS] {stamp} — {m} vandaag al opgevraagd (429), overgeslagen")
         rijen = naar_rijen(items)
         if rijen:
             schrijf_meter(rijen)
@@ -119,6 +135,8 @@ def main():
         return
 
     if not rijen:
+        if len(beperkt) == len(maanden):
+            return                                  # alles al opgevraagd vandaag
         print(f"[DATADIS] {stamp} — geen data ontvangen voor {', '.join(maanden)}")
         stuur_telegram(f"Datadis: geen data ontvangen voor {', '.join(maanden)} ({stamp}).")
         return
@@ -127,7 +145,7 @@ def main():
     achter = (now.date() - datetime.date.fromisoformat(laatste)).days
     print(f"[DATADIS] {stamp} — {len(rijen)} uren weggeschreven "
           f"({rijen[0]['datum']} t/m {laatste}).")
-    if achter > MAX_ACHTERSTAND:
+    if len(sys.argv) == 1 and not beperkt and achter > MAX_ACHTERSTAND:
         stuur_telegram(f"Datadis: laatste meterdata is van {laatste}, "
                        f"{achter} dagen geleden. Kijk op datadis.es.")
 
